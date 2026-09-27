@@ -1,13 +1,13 @@
 {
   "url": "https://github.com/yinfang949-bit/Uma-Chat/releases",
   "client": {
-    "versionCode": 5,
-    "versionName": "3.2",
-    "notes": "1. 新增自动检测更新\n2. 修复若干问题"
+    "versionCode": 8,
+    "versionName": "3.5",
+    "notes": "1. 「角色卡（人设）」支持自动保存：改完停手约 1 秒自动生效，也可点「立即保存角色卡」\n2. 断线时会先暂存输入内容，重连后自动补发\n3. 清空不会自动保存（避免误清人设），还原请用「恢复默认人设」"
   },
   "server": {
-    "versionCode": 2,
-    "versionName": "1.1",
-    "notes": "1. 新增自动检测更新"
+    "versionCode": 6,
+    "versionName": "1.5",
+    "notes": "1. AI机器人（DS-Flash4.1）不再出现在「私聊 / 在线用户」名单里，只作为公共区成员参与聊天\n2. 对她发私聊会被直接拦截并提示，不会再凭空出现一个和她、且永远没有回复的私聊窗口\n3. /health 在线名单同步排除机器人"
   }
 }
