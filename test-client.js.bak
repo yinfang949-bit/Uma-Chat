@@ -1,0 +1,222 @@
+#!/usr/bin/env node
+/**
+ * Chat32 端到端联调测试
+ * 依赖 Node 内置 WebSocket 客户端（Node 21+；Node 20 需 --experimental-websocket）
+ *
+ * 运行：
+ *   node test-client.js
+ * 密码与服务器一致：
+ *   CHAT_PASSWORD=你的密码 node test-client.js
+ * 自定义服务器：
+ *   WS_URL=ws://192.168.1.10:8080 CHAT_PASSWORD=xxx node test-client.js
+ */
+'use strict';
+
+const URL = process.env.WS_URL || 'ws://127.0.0.1:8080';
+const PASSWORD = process.env.CHAT_PASSWORD || 'still_in_love';
+
+const results = [];
+let passed = 0;
+
+function ok(name) { results.push({ name, pass: true }); passed++; console.log('  ✓ ' + name); }
+function fail(name, detail) { results.push({ name, pass: false, detail }); console.log('  ✗ ' + name + ' — ' + detail); }
+function assert(name, cond, detail) { cond ? ok(name) : fail(name, detail || '断言失败'); }
+
+function makeClient() {
+  const c = { ws: null, queue: [], waiters: [] };
+  c.connect = () => new Promise((res, rej) => {
+    const ws = new WebSocket(URL);
+    c.ws = ws;
+    ws.onopen = () => res(c);
+    ws.onerror = () => rej(new Error('ws connect error'));
+    ws.onmessage = (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { m = { type: '__raw', data: String(e.data) }; }
+      const w = c.waiters.shift();
+      if (w) w(m); else c.queue.push(m);
+    };
+  });
+  c.next = (timeout = 4000) => new Promise((res, rej) => {
+    if (c.queue.length) return res(c.queue.shift());
+    const t = setTimeout(() => rej(new Error('等待消息超时')), timeout);
+    c.waiters.push((m) => { clearTimeout(t); res(m); });
+  });
+  c.nextType = async (type, timeout, pred) => {
+    for (;;) { const m = await c.next(timeout); if (m.type === type && (!pred || pred(m))) return m; }
+  };
+  c.drain = () => { c.queue.length = 0; };
+  c.login = (name, password = PASSWORD) => {
+    c.ws.send(JSON.stringify({ type: 'login', name, password }));
+  };
+  c.chat = (to, content) => { c.ws.send(JSON.stringify({ type: 'chat', to, content })); };
+  c.close = () => { try { c.ws.close(); } catch {} };
+  return c;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function main() {
+  console.log('Chat32 联调测试  →  ' + URL + '\n');
+
+  // 0. 密码错误被拒绝
+  {
+    const a = makeClient();
+    await a.connect();
+    a.ws.send(JSON.stringify({ type: 'login', name: 'hacker', password: 'wrong_password_' + Date.now() }));
+    const m = await a.nextType('err');
+    assert('密码错误被拒绝', m.code === 'BAD_PASSWORD', JSON.stringify(m));
+    a.close();
+    await sleep(100);
+  }
+
+  // 1. 非法名称（空）
+  {
+    const a = makeClient();
+    await a.connect();
+    a.login('   ');
+    const m = await a.nextType('err');
+    assert('空名称被拒绝', m.code === 'BAD_NAME', JSON.stringify(m));
+    a.close();
+    await sleep(100);
+  }
+
+  // 2. 未登录发消息被拒绝
+  {
+    const a = makeClient();
+    await a.connect();
+    a.chat('__public', 'hello');
+    const m = await a.nextType('err');
+    assert('未登录发消息被拒绝', m.code === 'NOT_LOGIN', JSON.stringify(m));
+    a.close();
+    await sleep(100);
+  }
+
+  const alice = makeClient();
+  await alice.connect();
+  alice.login('alice');
+  const okMsg = await alice.nextType('ok');
+  assert('alice 登录成功', okMsg.name === 'alice' && Array.isArray(okMsg.online), JSON.stringify(okMsg));
+  await sleep(200);
+  alice.drain();
+
+  // 3. 名称自动去空格
+  {
+    const d = makeClient();
+    await d.connect();
+    d.login('  dave  ');
+    const m = await d.nextType('ok');
+    assert('名称自动去空格', m.name === 'dave', JSON.stringify(m));
+    d.close();
+    await sleep(100);
+  }
+
+  // 4. 重名拒绝
+  {
+    const dup = makeClient();
+    await dup.connect();
+    dup.login('alice');
+    const m = await dup.nextType('err');
+    assert('重名（已在线）被拒绝', m.code === 'NAME_TAKEN', JSON.stringify(m));
+    dup.close();
+    await sleep(100);
+  }
+
+  // 5. 第二个用户上线
+  const bob = makeClient();
+  await bob.connect();
+  bob.login('bob');
+  const bobOk = await bob.nextType('ok');
+  assert('bob 登录成功', bobOk.name === 'bob', JSON.stringify(bobOk));
+  const aliceOnline = await alice.nextType('online', 4000, (m) => m.list.includes('bob'));
+  assert('alice 收到在线列表更新', aliceOnline.list.includes('alice') && aliceOnline.list.includes('bob'), JSON.stringify(aliceOnline));
+  const sysMsg = await alice.nextType('system', 4000, (m) => m.content.includes('bob'));
+  assert('alice 收到加入系统消息', sysMsg.content.includes('bob'), sysMsg.content);
+
+  // 6. 大厅广播
+  alice.chat('__public', '大家好，我是 alice');
+  const bobHall = await bob.nextType('chat');
+  const aliceHall = await alice.nextType('chat');
+  assert('大厅消息送达 bob', bobHall.content === '大家好，我是 alice' && bobHall.to === '__public', JSON.stringify(bobHall));
+  assert('发送者收到大厅回显', aliceHall.content === '大家好，我是 alice', JSON.stringify(aliceHall));
+
+  // 7. 私聊
+  alice.chat('bob', '私聊：在吗');
+  const bobPriv = await bob.nextType('chat');
+  const alicePriv = await alice.nextType('chat');
+  assert('私聊送达目标', bobPriv.to === 'bob' && bobPriv.from === 'alice' && bobPriv.content === '私聊：在吗', JSON.stringify(bobPriv));
+  assert('私聊发送者收到回显', alicePriv.to === 'bob' && alicePriv.from === 'alice' && alicePriv.content === '私聊：在吗', JSON.stringify(alicePriv));
+
+  // 8. 私聊离线目标
+  alice.chat('nobody', 'hi');
+  const errNo = await alice.nextType('err');
+  assert('私聊离线目标被拒绝', errNo.code === 'NOT_ONLINE', JSON.stringify(errNo));
+
+  // 9. HTML 注入原样转发
+  const evil = '<script>alert(1)</script><img src=x onerror=alert(2)>';
+  alice.chat('__public', evil);
+  const evilMsg = await bob.nextType('chat');
+  assert('HTML 内容原样转发（不执行不转义）', evilMsg.content === evil, JSON.stringify(evilMsg.content));
+
+  // 10. 超长消息被拒绝
+  alice.chat('__public', 'x'.repeat(2001));
+  const longErr = await alice.nextType('err');
+  assert('超长消息被拒绝', longErr.code === 'BAD_MSG', JSON.stringify(longErr));
+
+  // 11. 正常长消息
+  const longOk = '你好'.repeat(500);
+  alice.chat('__public', longOk);
+  const longMsg = await bob.nextType('chat');
+  assert('1000 字消息正常收发', longMsg.content === longOk, '长度=' + longMsg.content.length);
+
+  // 12. 二进制帧被拒绝
+  {
+    const c = makeClient();
+    await c.connect();
+    c.login('carol');
+    await c.nextType('ok');
+    c.ws.send(new Uint8Array([1, 2, 3]));
+    const m = await c.nextType('err');
+    assert('二进制帧被拒绝（仅文字）', m.code === 'BAD_MSG' && /文字/.test(m.msg), JSON.stringify(m));
+    c.close();
+    await sleep(100);
+  }
+
+  // 13. 历史补发：新用户登录应能拿到刚才发的公共消息
+  {
+    await sleep(1500); // 等服务器 history 落盘（也确保内存里已经有记录）
+    const eve = makeClient();
+    await eve.connect();
+    eve.login('eve');
+    await eve.nextType('ok');
+    const h = await eve.nextType('history', 4000);
+    assert(
+      'eve 登录后收到历史记录',
+      Array.isArray(h.messages) && h.messages.some(m => m.content === longOk || m.content === '大家好，我是 alice'),
+      '历史条数=' + (h.messages ? h.messages.length : 0)
+    );
+    eve.close();
+    await sleep(100);
+  }
+
+  // 14. 断线通知
+  bob.close();
+  const byeSys = await alice.nextType('system', 4000, (m) => m.content.includes('bob') && m.content.includes('离开'));
+  assert('收到离开系统消息', byeSys.content.includes('bob'), byeSys.content);
+  const byeOnline = await alice.nextType('online', 4000, (m) => !m.list.includes('bob'));
+  assert('在线列表移除 bob', !byeOnline.list.includes('bob'), JSON.stringify(byeOnline));
+
+  alice.close();
+  await sleep(100);
+
+  console.log(`\n结果：${passed}/${results.length} 通过`);
+  const failed = results.filter((r) => !r.pass);
+  if (failed.length) {
+    console.log('未通过项：');
+    failed.forEach((f) => console.log('  - ' + f.name + ': ' + f.detail));
+    process.exit(1);
+  }
+  console.log('全部通过 ✔');
+  process.exit(0);
+}
+
+main().catch((e) => { console.error('测试执行异常:', e); process.exit(2); });

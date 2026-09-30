@@ -1,0 +1,401 @@
+#!/usr/bin/env node
+/**
+ * Chat32 —— 极简聊天服务器（零 npm 依赖）
+ *
+ * 运行：
+ *   CHAT_PASSWORD=你的密码 node server.js
+ * 或直接改下面 CHAT_PASSWORD 默认值后：
+ *   node server.js
+ */
+'use strict';
+
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = Number(process.env.PORT || 8080);
+
+// ⚠️ 改这里，或用环境变量 CHAT_PASSWORD 覆盖
+const CHAT_PASSWORD = process.env.CHAT_PASSWORD || '改成你自己的密码';
+
+const NAME_MAX = 20;
+const MSG_MAX = 2000;
+const MAX_FRAME = 64 * 1024;
+const PING_INTERVAL = 30000;
+
+// 聊天记录本地存储（就在 server.js 同目录）
+const HISTORY_FILE = path.join(__dirname, 'chat_history.jsonl');
+const HISTORY_MAX = 2000;   // 内存里最多保留多少条
+const HISTORY_SEND = 100;   // 登录时最多补发多少条
+
+const NAME_RE = /^[^\s\u0000-\u001f]{1,20}$/u;
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+/** 在线用户表：name -> conn */
+const clients = new Map();
+
+// ---------------------------------------------------------------------------
+// 历史记录：加载 / 保存
+// ---------------------------------------------------------------------------
+
+let history = [];
+try {
+  if (fs.existsSync(HISTORY_FILE)) {
+    const lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines.slice(-HISTORY_MAX)) {
+      try { history.push(JSON.parse(line)); } catch {}
+    }
+    console.log(`已加载 ${history.length} 条历史记录（${HISTORY_FILE}）`);
+  }
+} catch (err) {
+  console.error('加载历史记录失败:', err.message);
+}
+
+let saveTimer = null;
+
+function scheduleHistorySave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      const tmp = HISTORY_FILE + '.tmp';
+      const data = history.length
+        ? history.map(h => JSON.stringify(h)).join('\n') + '\n'
+        : '';
+      fs.writeFileSync(tmp, data);
+      fs.renameSync(tmp, HISTORY_FILE);
+    } catch (err) {
+      console.error('保存历史记录失败:', err.message);
+    }
+  }, 1000); // 1 秒合并写一次，避免频繁写盘
+}
+
+function recordHistory(record) {
+  history.push(record);
+  if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
+  scheduleHistorySave();
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket 帧编解码（RFC 6455）
+// ---------------------------------------------------------------------------
+
+function wsAccept(key) {
+  return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+}
+
+function encodeFrame(opcode, payload) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function createParser() {
+  let buf = Buffer.alloc(0);
+  let fragmented = null;
+  let fragOpcode = 0;
+
+  function parse() {
+    const out = [];
+    for (;;) {
+      if (buf.length < 2) break;
+      const b0 = buf[0];
+      const b1 = buf[1];
+      const fin = (b0 & 0x80) !== 0;
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let len = b1 & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) break;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) break;
+        const big = buf.readBigUInt64BE(2);
+        if (big > BigInt(MAX_FRAME)) throw new Error('frame too large');
+        len = Number(big);
+        off = 10;
+      }
+      if (len > MAX_FRAME) throw new Error('frame too large');
+      const maskLen = masked ? 4 : 0;
+      if (buf.length < off + maskLen + len) break;
+      let payload = buf.slice(off + maskLen, off + maskLen + len);
+      if (masked) {
+        const mask = buf.slice(off, off + 4);
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      }
+      buf = buf.slice(off + maskLen + len);
+
+      if (opcode === 0x0) {
+        if (!fragmented) throw new Error('unexpected continuation');
+        fragmented.chunks.push(payload);
+        if (fin) {
+          const whole = Buffer.concat(fragmented.chunks);
+          if (whole.length > MAX_FRAME) throw new Error('frame too large');
+          out.push({ opcode: fragOpcode, payload: whole });
+          fragmented = null;
+        }
+      } else if (opcode === 0x1 || opcode === 0x2) {
+        if (fin) {
+          out.push({ opcode, payload });
+        } else {
+          fragmented = { chunks: [payload] };
+          fragOpcode = opcode;
+        }
+      } else if (opcode === 0x8 || opcode === 0x9 || opcode === 0xA) {
+        out.push({ opcode, payload });
+      } else {
+        throw new Error('bad opcode ' + opcode);
+      }
+    }
+    return out;
+  }
+
+  return {
+    push(chunk) {
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      return parse();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 协议处理
+// ---------------------------------------------------------------------------
+
+function send(sock, obj) {
+  if (sock.destroyed || !sock.writable) return;
+  const frame = encodeFrame(0x1, Buffer.from(JSON.stringify(obj), 'utf8'));
+  sock.write(frame);
+}
+
+function broadcast(obj, except) {
+  const frame = encodeFrame(0x1, Buffer.from(JSON.stringify(obj), 'utf8'));
+  for (const c of clients.values()) {
+    if (c.socket !== except && !c.socket.destroyed && c.socket.writable) c.socket.write(frame);
+  }
+}
+
+function pushOnlineList() {
+  broadcast({ type: 'online', list: [...clients.keys()] });
+}
+
+function pushSystem(text) {
+  broadcast({ type: 'system', content: text, time: Date.now() });
+}
+
+function log(...args) {
+  console.log(new Date().toISOString().replace('T', ' ').slice(0, 19), ...args);
+}
+
+function handleMessage(conn, text) {
+  let msg;
+  try {
+    msg = JSON.parse(text);
+  } catch {
+    return send(conn.socket, { type: 'err', code: 'BAD_MSG', msg: '消息不是合法 JSON' });
+  }
+  if (!msg || typeof msg !== 'object') return;
+
+  switch (msg.type) {
+    case 'login': {
+      if (typeof msg.password !== 'string' || msg.password !== CHAT_PASSWORD) {
+        return send(conn.socket, { type: 'err', code: 'BAD_PASSWORD', msg: '密码错误' });
+      }
+      const raw = typeof msg.name === 'string' ? msg.name.trim() : '';
+      if (!NAME_RE.test(raw)) {
+        return send(conn.socket, { type: 'err', code: 'BAD_NAME', msg: `名称需为 1~${NAME_MAX} 个字符，且不含空格` });
+      }
+      if (clients.has(raw)) {
+        return send(conn.socket, { type: 'err', code: 'NAME_TAKEN', msg: `"${raw}" 当前已在线，请换一个名称` });
+      }
+
+      conn.name = raw;
+      clients.set(raw, conn);
+
+      // 登录成功
+      send(conn.socket, { type: 'ok', name: raw, online: [...clients.keys()] });
+
+      // 补发历史：公共消息 + 与自己相关的私聊
+      const recent = history
+        .filter(h => h.to === '__public' || h.from === raw || h.to === raw)
+        .slice(-HISTORY_SEND);
+      if (recent.length) {
+        send(conn.socket, { type: 'history', messages: recent });
+      }
+
+      pushOnlineList();
+      pushSystem(`"${raw}" 加入了聊天`);
+      log(`+ ${raw}（在线 ${clients.size}）`);
+      break;
+    }
+
+    case 'chat': {
+      if (!conn.name) {
+        return send(conn.socket, { type: 'err', code: 'NOT_LOGIN', msg: '请先登录' });
+      }
+      const content = typeof msg.content === 'string' ? msg.content.trim() : '';
+      if (!content || content.length > MSG_MAX) {
+        return send(conn.socket, { type: 'err', code: 'BAD_MSG', msg: `消息需为 1~${MSG_MAX} 个字符的纯文字` });
+      }
+      const to = typeof msg.to === 'string' && msg.to ? msg.to : '__public';
+      const payload = { type: 'chat', from: conn.name, to, content, time: Date.now() };
+
+      // 存本地历史
+      recordHistory({ from: conn.name, to, content, time: payload.time });
+
+      if (to === '__public') {
+        broadcast(payload);
+      } else {
+        const target = clients.get(to);
+        if (!target) {
+          return send(conn.socket, { type: 'err', code: 'NOT_ONLINE', msg: `"${to}" 不在线，无法私聊` });
+        }
+        if (target.socket !== conn.socket) send(target.socket, payload);
+        send(conn.socket, payload);
+      }
+      break;
+    }
+
+    case 'ping':
+      send(conn.socket, { type: 'pong', time: Date.now() });
+      break;
+
+    default:
+      send(conn.socket, { type: 'err', code: 'BAD_MSG', msg: '未知消息类型' });
+  }
+}
+
+function dropClient(conn, reason) {
+  if (!conn.name || conn.dropped) return;
+  conn.dropped = true;
+  clients.delete(conn.name);
+  log(`- ${conn.name}（${reason}，在线 ${clients.size}）`);
+  pushSystem(`"${conn.name}" 离开了聊天`);
+  pushOnlineList();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP + WebSocket 升级
+// ---------------------------------------------------------------------------
+
+const server = http.createServer((req, res) => {
+  const url = req.url.split('?')[0];
+  if (url === '/' || url === '/index.html') {
+    const file = path.join(__dirname, 'client', 'index.html');
+    fs.readFile(file, (err, data) => {
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('client/index.html 不存在');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(data);
+    });
+    return;
+  }
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not Found');
+});
+
+server.on('upgrade', (req, socket) => {
+  const key = req.headers['sec-websocket-key'];
+  const version = req.headers['sec-websocket-version'];
+  if (!key || version !== '13') {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\n' +
+    'Connection: Upgrade\r\n' +
+    `Sec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`
+  );
+
+  const conn = { socket, parser: createParser(), name: null, alive: true, dropped: false };
+  socket.on('data', (chunk) => {
+    let frames;
+    try {
+      frames = conn.parser.push(chunk);
+    } catch (err) {
+      log('协议错误，断开连接:', err.message);
+      try { socket.write(encodeFrame(0x8, Buffer.from(err.message.slice(0, 100)))) } catch {}
+      socket.destroy();
+      dropClient(conn, '协议错误');
+      return;
+    }
+    for (const f of frames) {
+      if (f.opcode === 0x1) {
+        try {
+          handleMessage(conn, f.payload.toString('utf8'));
+        } catch (err) {
+          log('处理消息出错:', err.message);
+          send(conn.socket, { type: 'err', code: 'INTERNAL', msg: '服务器处理消息出错' });
+        }
+      } else if (f.opcode === 0x8) {
+        try { socket.write(encodeFrame(0x8, f.payload)) } catch {}
+        socket.end();
+        dropClient(conn, '正常关闭');
+      } else if (f.opcode === 0x9) {
+        try { socket.write(encodeFrame(0xA, f.payload)) } catch {}
+      } else if (f.opcode === 0xA) {
+        conn.alive = true;
+      } else if (f.opcode === 0x2) {
+        send(conn.socket, { type: 'err', code: 'BAD_MSG', msg: '本软件仅支持文字，不接受二进制消息' });
+      }
+    }
+  });
+  socket.on('error', () => {});
+  socket.on('close', () => dropClient(conn, '连接断开'));
+});
+
+// 心跳
+setInterval(() => {
+  for (const conn of clients.values()) {
+    if (!conn.alive) {
+      try { conn.socket.destroy() } catch {}
+      dropClient(conn, '心跳超时');
+      continue;
+    }
+    conn.alive = false;
+    try { conn.socket.write(encodeFrame(0x9, Buffer.alloc(0))) } catch {}
+  }
+}, PING_INTERVAL).unref();
+
+// 退出时落盘
+function flushOnExit() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  try {
+    const data = history.length
+      ? history.map(h => JSON.stringify(h)).join('\n') + '\n'
+      : '';
+    fs.writeFileSync(HISTORY_FILE, data);
+  } catch {}
+}
+process.on('SIGINT', () => { flushOnExit(); process.exit(0); });
+process.on('SIGTERM', () => { flushOnExit(); process.exit(0); });
+
+server.listen(PORT, () => {
+  console.log('Chat32 服务器已启动');
+  console.log(`  本机访问:   http://127.0.0.1:${PORT}`);
+  console.log(`  局域网访问: http://<本机IP>:${PORT}`);
+  console.log(`  密码:       ${CHAT_PASSWORD === '改成你自己的密码' ? '⚠️ 还在用默认值，请立刻改掉！' : '已设置'}`);
+  console.log(`  聊天记录:   ${HISTORY_FILE}`);
+});
