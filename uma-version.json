@@ -2,10 +2,8 @@
   "url": "https://github.com/yinfang949-bit/Uma-Chat/releases",
   "client": {
     "versionCode": 10,
-    "versionName": "4.0",
-    "notes": "正式版哦 顺便把ai无法使用也解决了
-加了一个离线可以不丢失消息的功能 就是原本离线后别人发消息你看不到 现在小改一下会先把消息存到服务器 你上线再发你 服务器里存储的消息也会自动删除
-虽然改的不多但还是觉得改了点核心？所以版本变了"
+    "versionName": "4.1",
+    "notes": "加个液态玻璃，没事干。"
   },
   "server": {
     "versionCode": 7,
